@@ -1,34 +1,36 @@
-# Football Player & Ball Tracking 
+# Football Analysis & Tracking
 
 ## Description
 
-This project analyzes football match videos to detect players, referees, and the ball using **YOLOv8**.
-It classifies players into teams by shirt color, identifies referees based on position, and tracks which player is in possession of the ball.
-The output is an annotated video showing all players, referees, the ball, and player IDs for clear visualization.
+This project analyzes football match videos to detect players, referees, and the ball using **YOLOv8** and **Norfair Tracker**.
+It classifies players into teams by shirt color, identifies referees, tracks the ball using a **Kalman Filter**, and determines ball possession based on proximity.
+
+The output is a stabilized, annotated video showing players, referees, ball, and unique player IDs for clear visualization.
 
 ---
 
 ## Features
 
-* **Player & Ball Detection:** Detects all players and the ball in each video frame using YOLOv8.
-* **Player ID Tracking:** Maintains a unique ID for each player across frames to avoid reassignment.
-* **Team Classification:** Distinguishes Team A vs Team B using shirt color analysis in HSV color space.
-* **Referee Identification:** Detects referees based on position (outside pitch or near sidelines) and shirt color.
-* **Ball Possession Tracking:** Determines the player closest to the ball using Euclidean distance.
-* **Visual Output:** Annotated video showing players, referees, the ball, and their IDs.
+* **Player & Ball Detection:** Detects players and the ball using YOLOv8.
+* **Tracking:** Maintains unique IDs across frames using **Norfair Tracker**.
+* **Team Classification:** Distinguishes teams by shirt color (Blue, White) and identifies referees (Ref) using HSV analysis.
+* **Ball Prediction:** Stabilizes ball position with a **Kalman Filter** when detections are missing.
+* **Ball Possession Tracking:** Determines which player is in possession using Euclidean distance and smoothing over frames.
+* **Visual Output:** Annotated video with rectangles for players/referees, circles for the ball, and player IDs.
 
 ---
 
 ## Technical Details
 
-| Feature                 | Method                                                    | Accuracy / Notes                               |
-| ----------------------- | --------------------------------------------------------- | ---------------------------------------------- |
-| Player & Ball Detection | `model.track(frame, persist=True, conf=0.35, iou=0.6)`    | 85-95% depending on video quality              |
-| ID Tracking             | `results.boxes.id`                                        | Ensures continuity across frames               |
-| Team Classification     | `classify_team(shirt)` using HSV & white ratio            | ~90% accuracy if shirts are distinct           |
-| Referee Identification  | `inside_pitch()` & `near_sideline()`                      | Accurate if referees are outside crowded areas |
-| Ball Possession         | `euclidean(ball_center, player_center) < POSSESSION_DIST` | High accuracy within set distance threshold    |
-| Output Video            | `cv2.rectangle`, `cv2.putText`                            | Clear visual annotations for all entities      |
+| Feature                 | Method                                                    | Notes / Accuracy                                   |
+| ----------------------- | --------------------------------------------------------- | -------------------------------------------------- |
+| Player & Ball Detection | `YOLOv8(model)(frame)`                                    | Conf threshold 0.4                                 |
+| Tracking                | `Norfair Tracker(distance_threshold=35)`                  | Smooths IDs across frames                          |
+| Team Classification     | `classify_team(frame, bbox, track_id)` using HSV          | Majority voting over 10 frames                     |
+| Referee Identification  | HSV check + shirt color + region                          | Detects referees as "REF"                          |
+| Ball Tracking           | `BallKalman` class using Kalman Filter                    | Predicts ball when temporarily lost                |
+| Ball Possession         | Nearest player to ball over `POSSESSION_CONFIRM_FRAMES=8` | Reduces flickering, smooth possession              |
+| Output Video            | OpenCV rectangles & circles                               | Players: Blue/White, Ref: Yellow, Possessor: White |
 
 ---
 
@@ -37,81 +39,72 @@ The output is an annotated video showing all players, referees, the ball, and pl
 * **Python:** 3.10+
 * **Libraries:**
 
-  * OpenCV (`opencv-python`)
-  * Numpy (`numpy`)
-  * Ultralytics YOLOv8 (`ultralytics`)
-  * SciPy (`scipy`)
-
 ```bash
-pip install opencv-python numpy ultralytics scipy
+pip install opencv-python numpy ultralytics norfair
 ```
 
 ---
 
 ## Configuration Parameters
 
-| Parameter         | Description                              | Default / Example |
-| ----------------- | ---------------------------------------- | ----------------- |
-| `BALL_CLASS`      | YOLO class ID for the ball               | 32                |
-| `PLAYER_CLASS`    | YOLO class ID for players                | 0                 |
-| `POSSESSION_DIST` | Max distance to consider ball possession | 60 pixels         |
-| `WHITE_THRESHOLD` | Ratio of white to classify Team A        | 0.15              |
-
-> Adjust these values according to video quality, pitch size, and team jersey colors.
+| Parameter                   | Description                            | Default / Example                 |
+| --------------------------- | -------------------------------------- | --------------------------------- |
+| `MODEL_PATH`                | YOLOv8 model path                      | `"yolov8n.pt"`                    |
+| `VIDEO_PATH`                | Input video path                       | `"E:\\Sport\\tactical video.mp4"` |
+| `OUTPUT_VIDEO`              | Output annotated video path            | `"football_SportAI.avi"`          |
+| `PLAYER_CLASS`              | YOLO class ID for players              | 0                                 |
+| `BALL_CLASS`                | YOLO class ID for the ball             | 32                                |
+| `CONF_THRESHOLD`            | Minimum confidence for detections      | 0.4                               |
+| `DISTANCE_THRESHOLD`        | Tracker distance threshold             | 35                                |
+| `POSSESSION_THRESHOLD`      | Max distance to assign ball possession | 60                                |
+| `TEAM_LOCK_FRAMES`          | Number of frames to confirm team color | 10                                |
+| `POSSESSION_CONFIRM_FRAMES` | Number of frames to confirm possession | 8                                 |
 
 ---
 
-## Code Structure
+## Code Workflow
 
 ### 1. Imports & Config
 
-* Load all required libraries and define constants for model path, video path, classes, and thresholds.
+* Load OpenCV, NumPy, YOLOv8, Norfair, and helper classes.
+* Define paths, class IDs, thresholds, and tracker parameters.
 
-### 2. Model & Video Initialization
+### 2. Ball Kalman Filter
 
-* Load YOLOv8 model.
-* Open the input video and initialize the output video writer.
+* Stabilizes ball coordinates between frames.
+* Methods: `update(x, y)` → update & predict, `predict_only()` → predict without update.
 
-### 3. Helper Functions
+### 3. Team Classification
 
-* `center(box)` → Returns the center of a bounding box.
-* `classify_team(crop)` → Determines team based on shirt color.
-* `inside_pitch(cx, cy)` → Checks if a player is within pitch bounds.
-* `near_sideline(cx, cy)` → Checks if a player is near pitch boundaries (for referee detection).
+* HSV-based shirt color detection:
+
+  * **Referee:** 85 < H < 115, S > 40 → `"REF"`
+  * **White Shirt:** V > 170 & S < 60 → `"WHITE"`
+  * Otherwise → `"BLUE"`
+* Uses a frame-memory and majority vote over `TEAM_LOCK_FRAMES` to avoid flickering.
 
 ### 4. Main Loop
 
-* Read video frame by frame.
-* Detect and track players, referees, and ball.
-* Assign IDs to each detected player.
+1. Read video frame by frame.
+2. Detect objects with YOLOv8.
+3. Separate detections for players and ball.
+4. Track players & ball using **Norfair Tracker**.
+5. Update ball position using **Kalman Filter** if missing.
+6. Assign team labels to players.
+7. Determine ball possession using nearest player and frame smoothing.
+8. Draw bounding boxes, IDs, and ball circle.
+9. Save frame to output video and optionally display live.
 
-### 5. Detection Boxes & ID Extraction
+### 5. Drawing & Output
 
-* Extract bounding boxes, class IDs, and tracking IDs from YOLO outputs.
-* Calculate player and ball centers for tracking.
-
-### 6. Possession Logic
-
-* Determine which player is closest to the ball within `POSSESSION_DIST`.
-* Mark that player as having possession.
-
-### 7. Drawing & Output
-
-* Draw rectangles around players and referees, circles for the ball.
-* Annotate each player with their ID and highlight the possessor.
-* Save each processed frame to the output video.
-
-### 8. Cleanup
-
-* Release video resources and close all OpenCV windows.
-
----
-
-## Visual Output
-
-* **Team A Players:** Red rectangles
-* **Team B Players:** Blue rectangles
-* **Player in Possession:** Red rectangle regardless of team
-* **Referees:** Yellow rectangle with label "REF"
+* **Players:** Blue or White rectangles
+* **Referees:** Yellow rectangle with label `"REF"`
+* **Player in Possession:** White rectangle (overrides team color)
 * **Ball:** Green circle
-* **Player IDs:** Displayed above each bounding box
+* **Player IDs:** Shown above bounding boxes
+
+### 6. Cleanup
+
+* Release video and output writer.
+* Close OpenCV windows.
+
