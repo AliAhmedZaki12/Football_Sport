@@ -1,223 +1,284 @@
-# ============================================================
-# Football Analysis - Importing (Libraries & Configs)
-# ============================================================
+# ===============================
+# Football Player (Tracking  & Analytics)
+# ===============================
 
+# ===============================
+# IMPORTS
+# ===============================
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from norfair import Tracker, Detection
-from collections import defaultdict, Counter
+from scipy.spatial.distance import euclidean
+from collections import defaultdict, deque
 
+# ===============================
+# CONFIGURATION
+# ===============================
+MODEL_PATH = "yolov8n.pt"                             # YOLOv8 model path
+VIDEO_PATH = r"E:\Sport\video_2026-02-07_23-44-07.mp4"
+OUTPUT_VIDEO = "football_SportAI_Final.avi"          # Annotated output video
+OUTPUT_MAP_VIDEO = "football_TopDown_Final.avi"      # Top-Down map video
 
-MODEL_PATH = "yolov8n.pt"
-VIDEO_PATH = "E:\\Sport\\tactical video.mp4"
-OUTPUT_VIDEO = "football_SportAI.avi"
+BALL_CLASS = 32                                      # YOLO class ID for ball
+PLAYER_CLASS = 0                                     # YOLO class ID for players
+POSSESSION_DIST = 70                                 # Distance threshold for possession detection
+MAX_MISSING_FRAMES = 10                              # Frames allowed without detecting ball
 
-PLAYER_CLASS = 0
-BALL_CLASS = 32
+# Memory for stabilizing team classification per player
+track_memory = defaultdict(lambda: deque(maxlen=25))
 
-CONF_THRESHOLD = 0.4
-DISTANCE_THRESHOLD = 35
-POSSESSION_THRESHOLD = 60
-TEAM_LOCK_FRAMES = 10
-POSSESSION_CONFIRM_FRAMES = 8
+# ===============================
+# LOAD YOLO MODEL
+# ===============================
+model = YOLO(MODEL_PATH)
+cap = cv2.VideoCapture(VIDEO_PATH)
 
-# ============================================================
-# Ball Kalman Filter
-# ============================================================
+w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = cap.get(cv2.CAP_PROP_FPS) or 25
 
-class BallKalman:
-    def __init__(self):
-        self.kf = cv2.KalmanFilter(4, 2)
-        self.kf.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
-        self.kf.transitionMatrix = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], np.float32)
-        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-        self.initialized = False
+# Video writer for annotated video
+out = cv2.VideoWriter(
+    OUTPUT_VIDEO,
+    cv2.VideoWriter_fourcc(*"XVID"),
+    fps,
+    (w, h)
+)
 
-    def update(self, x, y):
-        if not self.initialized:
-            self.kf.statePre = np.array([[x],[y],[0],[0]], np.float32)
-            self.initialized = True
-        measurement = np.array([[np.float32(x)], [np.float32(y)]])
-        self.kf.correct(measurement)
-        prediction = self.kf.predict()
-        return int(prediction[0]), int(prediction[1])
+# Video writer for Top-Down map
+MAP_W, MAP_H = 700, 500
+map_out = cv2.VideoWriter(
+    OUTPUT_MAP_VIDEO,
+    cv2.VideoWriter_fourcc(*"XVID"),
+    fps,
+    (MAP_W, MAP_H)
+)
 
-    def predict_only(self):
-        prediction = self.kf.predict()
-        return int(prediction[0]), int(prediction[1])
+# ===============================
+# HELPER FUNCTIONS
+# ===============================
+def center(box):
+    """
+    Returns the center coordinates (x,y) of a bounding box.
+    """
+    x1, y1, x2, y2 = box
+    return int((x1+x2)/2), int((y1+y2)/2)
 
-# ============================================================
-# Team Classification 
-# ============================================================
-
-team_memory = defaultdict(list)
-team_locked = {}
-
-def classify_team(frame, bbox, track_id):
-    if track_id in team_locked:
-        return team_locked[track_id]
-
-    x1, y1, x2, y2 = map(int, bbox)
-    y1s = int(y1 + (y2 - y1) * 0.2)
-    y2s = int(y1 + (y2 - y1) * 0.45)
-    crop = frame[y1s:y2s, x1:x2]
-
-    if crop.size == 0:
-        return "BLUE"
-
+def is_white_jersey(crop):
+    """
+    Detects if the shirt area corresponds to a white jersey using HSV threshold.
+    """
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    median_hsv = np.median(hsv.reshape(-1, 3), axis=0)
-    h, s, v = median_hsv
+    h, s, v = cv2.split(hsv)
+    mask = np.logical_and(s < 75, v > 155)
+    ratio = np.sum(mask) / mask.size
+    return ratio > 0.05
 
-    if 85 < h < 115 and s > 40:
-        label = "REF"
-    elif v > 170 and s < 60:
-        label = "WHITE"
-    else:
-        label = "BLUE"
+def is_sky_blue(crop):
+    """
+    Detects if the shirt area corresponds to sky-blue referee jersey using HSV threshold.
+    """
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array([85,40,120]), np.array([120,255,255]))
+    ratio = np.sum(mask>0) / mask.size
+    return ratio > 0.06
 
-    team_memory[track_id].append(label)
-    if len(team_memory[track_id]) >= TEAM_LOCK_FRAMES:
-        majority = Counter(team_memory[track_id]).most_common(1)[0][0]
-        team_locked[track_id] = majority
-        return majority
+def stable_role(track_id, new_role):
+    """
+    Stabilizes the role classification of a player using memory of previous roles.
+    """
+    memory = track_memory[track_id]
+    memory.append(new_role)
+    if memory.count("A") > 6: return "A"
+    if memory.count("REF") > 4: return "REF"
+    return max(set(memory), key=memory.count)
 
-    return label
+# ===============================
+# BALL TRACKER USING KALMAN FILTER
+# ===============================
+class BallTrackerKF:
+    """
+    Kalman Filter based tracker for the football to smooth ball movement.
+    - Predicts ball position when not detected.
+    - Keeps track of visibility.
+    """
+    def __init__(self):
+        self.kalman = cv2.KalmanFilter(4,2)
+        self.kalman.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
+        self.kalman.transitionMatrix = np.array([[1,0,1,0],
+                                                 [0,1,0,1],
+                                                 [0,0,1,0],
+                                                 [0,0,0,1]], np.float32)
+        self.kalman.processNoiseCov = np.eye(4, dtype=np.float32)*0.03
+        self.predicted = None
+        self.missing_frames = 0
+        self.visible = False
 
-# ============================================================
-# MAIN
-# ============================================================
+    def update(self, pos=None):
+        """
+        Updates the Kalman filter with a new position (if available).
+        Returns the predicted or corrected position of the ball.
+        """
+        if pos is not None:
+            measurement = np.array([[np.float32(pos[0])],[np.float32(pos[1])]])
+            self.kalman.correct(measurement)
+            self.missing_frames = 0
+            self.visible = True
+        else:
+            self.missing_frames += 1
+            if self.missing_frames > MAX_MISSING_FRAMES:
+                self.visible = False
 
-def main():
-    model = YOLO(MODEL_PATH)
+        self.predicted = self.kalman.predict()
+        x, y = self.predicted[:2].flatten()
+        return int(x), int(y)
 
-    tracker_players = Tracker(distance_function="euclidean", distance_threshold=DISTANCE_THRESHOLD)
-    tracker_ball = Tracker(distance_function="euclidean", distance_threshold=30)
-    kalman = BallKalman()
+# Initialize ball tracker and possession smoothing
+ball_tracker = BallTrackerKF()
+possessor_smooth = None
 
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    if not cap.isOpened():
-        raise RuntimeError("Error opening video file")
+# ===============================
+# PERSPECTIVE TRANSFORMATION (TOP-DOWN MAP)
+# ===============================
+src_pts = np.float32([[0,0],[w,0],[0,h],[w,h]])         # Video frame corners
+dst_pts = np.float32([[0,0],[MAP_W,0],[0,MAP_H],[MAP_W,MAP_H]])  # Map corners
+M = cv2.getPerspectiveTransform(src_pts, dst_pts)
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+# ===============================
+# MAIN LOOP: VIDEO PROCESSING
+# ===============================
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-    out = cv2.VideoWriter(
-        OUTPUT_VIDEO,
-        cv2.VideoWriter_fourcc(*"XVID"),
-        fps,
-        (width, height)
-    )
+    players = []
+    ball_center = None
+    infer_frame = frame.copy()
 
-    possession_candidate = None
-    possession_counter = 0
-    confirmed_possession = None
+    # -------- YOLO TRACKING --------
+    results = model.track(
+        infer_frame,
+        persist=True,
+        tracker="bytetrack.yaml",
+        conf=0.20,
+        imgsz=1280,
+        iou=0.7,
+        agnostic_nms=True
+    )[0]
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    if results.boxes.id is not None:
+        for box, cls, tid in zip(
+            results.boxes.xyxy.cpu().numpy(),
+            results.boxes.cls.cpu().numpy(),
+            results.boxes.id.cpu().numpy()
+        ):
+            x1, y1, x2, y2 = map(int, box)
+            cx, cy = center((x1,y1,x2,y2))
 
-        results = model(frame)[0]
-
-        detections_players = []
-        detections_ball = []
-
-        # ---------------------------
-        # Detection
-        # ---------------------------
-        for box in results.boxes:
-            cls = int(box.cls[0])
-            conf = float(box.conf[0])
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            if conf < CONF_THRESHOLD:
+            # -------- BALL DETECTION --------
+            if int(cls) == BALL_CLASS:
+                ball_center = (cx, cy)
                 continue
 
-            if cls == PLAYER_CLASS:
-                detections_players.append(Detection(points=np.array([[x1,y1],[x2,y2]])))
-            elif cls == BALL_CLASS:
-                detections_ball.append(Detection(points=np.array([[x1,y1],[x2,y2]])))
+            # Ignore non-player objects
+            if int(cls) != PLAYER_CLASS:
+                continue
 
-        # ---------------------------
-        # Tracking
-        # ---------------------------
-        tracked_players = tracker_players.update(detections_players)
-        tracked_balls = tracker_ball.update(detections_ball)
+            # Shirt crop for team/referee classification
+            y1s = int(y1 + (y2-y1)*0.18)
+            y2s = int(y1 + (y2-y1)*0.40)
+            shirt = frame[y1s:y2s, x1:x2]
+            if shirt.size == 0: continue
 
-        players = []
-        ball_center = None
-
-        for obj in tracked_players:
-            x1, y1 = obj.estimate[0]
-            x2, y2 = obj.estimate[1]
-            team = classify_team(frame, (x1, y1, x2, y2), obj.id)
-            players.append((obj.id, (x1, y1, x2, y2), team))
-
-        if tracked_balls:
-            obj = tracked_balls[0]
-            x1, y1 = obj.estimate[0]
-            x2, y2 = obj.estimate[1]
-            cx = int((x1 + x2) / 2)
-            cy = int((y1 + y2) / 2)
-            ball_center = kalman.update(cx, cy)
-        else:
-            if kalman.initialized:
-                ball_center = kalman.predict_only()
-
-        # ---------------------------
-        # Possession Smoothing
-        # ---------------------------
-        if ball_center:
-            min_dist = POSSESSION_THRESHOLD
-            current_candidate = None
-
-            for pid, bbox, team in players:
-                if team == "REF":
-                    continue
-                px = int((bbox[0] + bbox[2]) / 2)
-                py = int((bbox[1] + bbox[3]) / 2)
-                dist = np.linalg.norm(np.array([px, py]) - np.array(ball_center))
-                if dist < min_dist:
-                    min_dist = dist
-                    current_candidate = pid
-
-            if current_candidate == possession_candidate:
-                possession_counter += 1
+            # Detect role
+            if is_sky_blue(shirt):
+                role = "REF"
+            elif is_white_jersey(shirt):
+                role = "A"
             else:
-                possession_candidate = current_candidate
-                possession_counter = 0
+                role = "B"
 
-            if possession_counter >= POSSESSION_CONFIRM_FRAMES:
-                confirmed_possession = possession_candidate
+            role = stable_role(int(tid), role)
 
-        # ---------------------------
-        # Drawing
-        # ---------------------------
-        for pid, bbox, team in players:
-            x1, y1, x2, y2 = map(int, bbox)
-            if team == "REF":
-                color = (0, 255, 255)
-            elif team == "WHITE":
-                color = (0, 0, 255)
-            else:
-                color = (255, 0, 0)
+            # Draw referees
+            if role == "REF":
+                cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,255),2)
+                cv2.putText(frame,"REF",(x1,y1-6),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,255),2)
+                continue
 
-            if pid == confirmed_possession:
-                color = (255, 255, 255)
+            players.append({
+                "id": int(tid),
+                "team": role,
+                "center": (cx,cy),
+                "box": (x1,y1,x2,y2)
+            })
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    # -------- BALL TRACKING --------
+    tracked_ball = ball_tracker.update(ball_center)
+    if ball_tracker.visible:
+        cv2.circle(frame, tracked_ball, 8, (0,255,0), -1)
 
-        if ball_center:
-            cx, cy = ball_center
-            cv2.circle(frame, (cx, cy), 6, (0, 255, 0), -1)
+    # -------- POSSESSION DETECTION --------
+    possessor = None
+    if tracked_ball:
+        min_d = POSSESSION_DIST
+        for p in players:
+            d = euclidean(tracked_ball, p["center"])
+            if d < min_d:
+                min_d = d
+                possessor = p
 
-        out.write(frame)
-        cv2.imshow("Stable Football Analysis", frame)
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
+    if possessor:
+        possessor_smooth = possessor
+    else:
+        possessor = possessor_smooth  # Keep last possessor if ball temporarily lost
 
-    cap.release()
-    out.release()
-    cv2.destroyAllWindows()
+    # -------- DRAW PLAYERS --------
+    for p in players:
+        x1,y1,x2,y2 = p["box"]
+        color = (0,0,255) if p["team"]=="A" else (255,0,0)
+        thickness = 2
+        if possessor and p["id"] == possessor["id"]:
+            color = (255,255,255)  # Highlight possessor
+            thickness = 3
+        cv2.rectangle(frame,(x1,y1),(x2,y2),color,thickness)
+        cv2.putText(frame,f"ID {p['id']}",(x1,y1-6),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.5,color,2)
+
+    # -------- DRAW TOP-DOWN MAP --------
+    map_frame = np.zeros((MAP_H, MAP_W, 3), dtype=np.uint8)
+    if ball_tracker.visible:
+        bx, by = cv2.perspectiveTransform(
+            np.array([[[tracked_ball[0], tracked_ball[1]]]], dtype=np.float32), M
+        )[0][0]
+        cv2.circle(map_frame, (int(bx), int(by)), 5, (0,255,0), -1)
+
+    for p in players:
+        px, py = cv2.perspectiveTransform(
+            np.array([[[p["center"][0], p["center"][1]]]], dtype=np.float32), M
+        )[0][0]
+        col = (0,0,255) if p["team"]=="A" else (255,0,0)
+        if possessor and p["id"] == possessor["id"]:
+            col = (255,255,255)
+        cv2.circle(map_frame, (int(px), int(py)), 5, col, -1)
+
+    # -------- SHOW FRAMES & WRITE VIDEOS --------
+    cv2.imshow("Football Analysis", frame)
+    cv2.imshow("Top-Down Map", map_frame)
+
+    out.write(frame)
+    map_out.write(map_frame)
+
+    if cv2.waitKey(1) == 27:  # Press ESC to exit
+        break
+
+# ===============================
+# RELEASE RESOURCES
+# ===============================
+cap.release()
+out.release()
+map_out.release()
+cv2.destroyAllWindows()
+
