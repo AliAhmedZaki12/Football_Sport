@@ -271,7 +271,7 @@ while cap.isOpened():
     out.write(frame)
     map_out.write(map_frame)
 
-    if cv2.waitKey(1) == 27:  # Press ESC to exit
+    if cv2.waitKey(1) == 27:  
         break
 
 # ===============================
@@ -281,4 +281,5 @@ cap.release()
 out.release()
 map_out.release()
 cv2.destroyAllWindows()
+
 
