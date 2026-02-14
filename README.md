@@ -12,12 +12,12 @@ The output includes a stabilized, annotated video and a top-down tactical map fo
 ## Features
 
 * **Player & Ball Detection:** Detects players and the ball using YOLOv8.
-* **Ball Tracking:** Uses a **Kalman Filter** to predict ball positions when detection is temporarily missing.
-* **Team Classification:** Distinguishes teams (Blue / White) and referees (Ref) using HSV analysis of shirt color.
-* **Ball Possession Tracking:** Assigns ball possession to the nearest player with smoothing to avoid flickering.
-* **Top-Down Tactical Map:** Perspective transformation of the field showing player and ball positions.
-* **Visual Output:** Annotated video with bounding boxes for players/referees, circles for the ball, and player IDs.
-
+* **Ball Tracking:** Implements a Kalman Filter to maintain stable ball tracking during temporary occlusions or missed detections.
+* **Team Classification:** Classifies players into **Blue** and **Red** teams and identifies referees (**Ref**) using HSV-based shirt color analysis.
+* **Ball Possession Tracking:** Assigns ball possession to the nearest player with temporal smoothing to prevent flickering. The active ball carrier is uniquely highlighted in **White** for clear visual identification.
+* **Top-Down Tactical Map:** Applies perspective transformation to generate a bird’s-eye tactical view of player and ball positioning.
+* **Visual Output:** Produces an annotated match video including bounding boxes, player IDs, a **Green** ball indicator, and dynamic highlighting of the current ball possessor in **White**.
+  
 ---
 
 ## Technical Details
